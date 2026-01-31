@@ -64,4 +64,3 @@ run_now: false
 - You must be logged in to Reddit (via system browser profile, cookies file, or the bot’s own profile) for upvoting to work.
 - **`use_chrome_cookies`:** Uses your real Chrome/Edge profile so Reddit sees your normal cookies and is less likely to ask “verify you’re not a bot.” Close that browser completely before the scheduled run so the profile isn’t locked.
 - **`cookies_file`:** Use [Cookie-Editor](https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm) to export as JSON (`cookies.json`) or Netscape (`cookies.txt`). Or use a Netscape-format `cookies.txt` (e.g. from “Get cookies.txt” or “EditThisCookie”). Re-export if your session expires.
-- To run headless (no browser window), set `headless=True` in the relevant `launch` / `launch_persistent_context` call in `reddit_streak.py` (login once in a non-headless run first if using the script’s profile).
