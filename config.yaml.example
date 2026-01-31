@@ -1,0 +1,26 @@
+# Reddit streak bot config
+# Copy this file to config.yaml and fill in your values.
+
+# Subreddit(s) to upvote on (without r/). One is chosen at random each run.
+subreddits: ["python", "askreddit"]
+# subreddit: "python"   # alternative: single subreddit
+
+# Time to run (24-hour format)
+run_time: "09:00"
+
+# Random wait (seconds) before removing the upvote
+wait_seconds_min: 30
+wait_seconds_max: 90
+
+# Auth: Chrome cookies or cookies file
+use_chrome_cookies: true
+# cookies_file: "cookies.json"   # optional; export with Cookie-Editor
+
+# Run once immediately (for testing)
+run_now: false
+
+# Test mode: run full upvote flow even if streak already reached
+test_mode: false
+
+# Your Reddit username (for streak check)
+reddit_username: ""

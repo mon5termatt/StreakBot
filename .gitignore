@@ -1,0 +1,9 @@
+browser_profile/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+cookies.json
+cookies.txt
+config.yaml
