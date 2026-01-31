@@ -2,6 +2,8 @@
 
 Keeps your Reddit streak active by upvoting one of the top 3 posts of the day on a subreddit you choose, then removing the upvote after a random delay. Runs at a time you set in the config.
 
+> **Disclaimer:** This project is not affiliated with Reddit, Inc. Use of this software may violate [Reddit’s Terms of Service](https://www.redditinc.com/policies/user-agreement) and [API Terms](https://www.redditinc.com/policies/data-api-terms). Automating interactions (e.g. voting) or scraping the site can result in account restrictions or bans. Use at your own risk.
+
 ## Setup
 
 1. **Create a virtual environment and install dependencies:**

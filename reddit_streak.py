@@ -5,9 +5,46 @@ waits a random time, then removes the upvote. Runs at a configured time daily.
 Auth: grabs cookies from your Chrome profile but uses its own window (Chrome can stay open). Or use cookies_file.
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Detect venv and create one if not running inside a virtual environment
+_BASE_DIR = Path(__file__).resolve().parent
+_VENV_DIR = _BASE_DIR / ".venv"
+
+
+def _in_venv() -> bool:
+    """True if we're running inside a virtual environment."""
+    if os.environ.get("VIRTUAL_ENV"):
+        return True
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def _ensure_venv() -> None:
+    """If not in a venv, create .venv, install deps, and re-exec this script inside it."""
+    if _in_venv():
+        return
+    if not _VENV_DIR.exists():
+        print("No virtual environment detected. Creating .venv and installing dependencies...")
+        import venv
+        venv.create(_VENV_DIR, with_pip=True)
+    py = _VENV_DIR / "Scripts" / "python.exe" if os.name == "nt" else _VENV_DIR / "bin" / "python"
+    if not py.exists():
+        py = _VENV_DIR / "bin" / "python"  # fallback
+    req = _BASE_DIR / "requirements.txt"
+    if req.exists():
+        subprocess.run([str(py), "-m", "pip", "install", "-r", str(req)], check=True, cwd=_BASE_DIR)
+    subprocess.run([str(py), "-m", "playwright", "install", "chromium"], check=True, cwd=_BASE_DIR)
+    print("Restarting inside virtual environment...")
+    os.execv(str(py), [str(py), os.path.abspath(__file__)] + sys.argv[1:])
+
+
+_ensure_venv()
+
 import json
 import logging
-import os
 import random
 import re
 import time
@@ -19,8 +56,38 @@ from playwright.sync_api import sync_playwright
 # Paths
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 USER_DATA_DIR = Path(__file__).resolve().parent / "browser_profile"
+TOS_ACCEPTED_PATH = Path(__file__).resolve().parent / ".streakbot_tos_accepted"
 
 log = logging.getLogger(__name__)
+
+
+def require_tos_acceptance() -> bool:
+    """One-time prompt: user must accept that use may violate Reddit TOS. Returns True if accepted (or already accepted)."""
+    if TOS_ACCEPTED_PATH.exists():
+        return True
+    print()
+    print("  Reddit Streak Bot — Terms of Service notice")
+    print("  --------------------------------------------")
+    print("  This software automates interaction with Reddit (upvoting and removing votes).")
+    print("  Such automation may violate Reddit's Terms of Service and can result in")
+    print("  account restrictions or bans. This project is not affiliated with Reddit.")
+    print()
+    while True:
+        try:
+            reply = input("  Type 'yes' to accept this risk and continue, or 'no' to exit: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+        if reply in ("yes", "y"):
+            try:
+                TOS_ACCEPTED_PATH.write_text("accepted", encoding="utf-8")
+            except OSError:
+                log.warning("Could not write TOS acceptance file; continuing anyway.")
+            return True
+        if reply in ("no", "n"):
+            print("  Exiting.")
+            return False
+        print("  Please type 'yes' or 'no'.")
 
 
 def load_config():
@@ -519,6 +586,9 @@ def main():
     )
     if level == logging.DEBUG:
         log.debug("Verbose (DEBUG) logging enabled")
+
+    if not require_tos_acceptance():
+        return
 
     config = load_config()
 
