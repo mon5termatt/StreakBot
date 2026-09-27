@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "StreakBot Cookie Export",
+  "version": "1.0.0",
+  "description": "Sends this Chrome profile's Reddit cookies to StreakBot on this computer when the script asks.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArQUiQ+53rXmClioAaNsEawBj2TuxM2i6Qzdz5y+ImAKG2gkzllIFQbA7eIDgb+IVun2E3VlRKZfv8YEWsnmE/LDq61cqB9nHu1/SEOLnpxItJdEffvyizzJ9dcOR2S2QqCg/HY5wWgs2qu2/R7wWyJnuaiwqPPYq/0BREkSG9YPcm5IYaEUgk3lss3iLn5pzyl5+GJXz3Mh7eIVYh0bm8u2jJZoZGcn2xFKn202lhXQP1W6+0W0+VVQXiP3cW0gtnGhYev2b7iT1/c5U/uGT34YCX9PEMms/2NBRyrH+GOXERtJkVrHd1mZ9SQ2d+lPKlYhHH2GG1ypNox0PXcntyQIDAQAB",
+  "permissions": ["cookies", "tabs"],
+  "host_permissions": ["*://*.reddit.com/*", "http://127.0.0.1/*"],
+  "action": {
+    "default_title": "StreakBot Cookie Export"
+  }
+}

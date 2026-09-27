@@ -2,7 +2,7 @@
 """
 Reddit streak bot: upvotes one of the top 3 posts of the day on a subreddit,
 waits a random time, then removes the upvote. Runs at a configured time daily.
-Auth: grabs cookies from your Chrome profile but uses its own window (Chrome can stay open). Or use cookies_file.
+Auth: asks the StreakBot Chrome extension for Reddit cookies, then uses its own window. Or use cookies_file.
 """
 
 import os
@@ -47,7 +47,10 @@ import json
 import logging
 import random
 import re
+import secrets
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import yaml
@@ -57,6 +60,8 @@ from playwright.sync_api import sync_playwright
 CONFIG_PATH = Path(__file__).resolve().parent / "config.yaml"
 USER_DATA_DIR = Path(__file__).resolve().parent / "browser_profile"
 TOS_ACCEPTED_PATH = Path(__file__).resolve().parent / ".streakbot_tos_accepted"
+EXTENSION_DIR = Path(__file__).resolve().parent / "extension"
+EXTENSION_ID = "gmeopkibjanmlpphhmblkiaakdfpcplc"
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +110,17 @@ def load_config():
     return cfg
 
 
+def _time_to_minutes(s: str) -> int:
+    """Convert 'HH:MM' to minutes since midnight."""
+    h, m = map(int, str(s).strip().split(":", 1))
+    return h * 60 + m
+
+
+def _minutes_to_time(m: int) -> str:
+    """Convert minutes since midnight to 'HH:MM'."""
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
 def get_subreddits(config) -> list[str]:
     """Return list of subreddit names from config (subreddits list or single subreddit)."""
     if "subreddits" in config and config["subreddits"]:
@@ -130,34 +146,167 @@ def get_user_urls(config) -> tuple[str, str]:
     return (streak, upvoted)
 
 
-def load_cookies_from_chrome(domain_name: str = "reddit.com") -> list[dict]:
-    """Load cookies from the Chrome profile (our own window; Chrome can stay open)."""
-    try:
-        import browser_cookie3
-    except ImportError:
-        log.error("browser_cookie3 not installed. Run: pip install browser-cookie3")
-        return []
-    try:
-        cj = browser_cookie3.chrome(domain_name=domain_name)
-    except Exception as e:
-        log.exception("Failed to load Chrome cookies: %s. Try closing Chrome, or use cookies_file.", e)
-        return []
+def _chrome_exe() -> Path | None:
+    """Path to the installed Chrome executable."""
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def write_extension_cookies_json(cookies: list, dest: Path) -> int:
+    """Write cookies from the Chrome extension. Returns count written, or 0 if there is no login session."""
     out = []
-    for c in cj:
-        domain = c.domain if c.domain.startswith(".") else f".{c.domain}"
-        cookie = {
-            "name": c.name,
-            "value": c.value,
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        domain = c.get("domain") or ""
+        name = c.get("name") or ""
+        if "reddit.com" not in domain or not name:
+            continue
+        out.append({
             "domain": domain,
-            "path": c.path or "/",
-            "secure": getattr(c, "secure", False),
-            "httpOnly": getattr(c, "has_nonstandard_attr", lambda x: False)("HttpOnly") or False,
-            "sameSite": "Lax",
-        }
-        if c.expires:
-            cookie["expires"] = int(c.expires)
-        out.append(cookie)
-    return out
+            "expirationDate": c.get("expirationDate"),
+            "hostOnly": bool(c.get("hostOnly", not str(domain).startswith("."))),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "name": name,
+            "path": c.get("path") or "/",
+            "sameSite": c.get("sameSite") or "lax",
+            "secure": bool(c.get("secure", False)),
+            "session": bool(c.get("session", False)),
+            "storeId": c.get("storeId"),
+            "value": c.get("value") or "",
+        })
+    if not any(c["name"] == "reddit_session" and c["value"] for c in out):
+        return 0
+    dest.write_text(json.dumps(out, indent=4), encoding="utf-8")
+    return len(out)
+
+
+def _log_extension_install_help() -> None:
+    log.warning(
+        "The cookie extension did not respond. In Chrome open chrome://extensions, enable Developer mode, "
+        "and Load unpacked this folder: %s",
+        EXTENSION_DIR,
+    )
+
+
+def export_chrome_cookies_via_extension(dest: Path) -> bool:
+    """Ask the installed StreakBot extension to send Reddit cookies to this process.
+
+    Chrome only decrypts cookies for code running inside Chrome. The extension reads them
+    and posts them to a localhost listener started for this call.
+    """
+    chrome = _chrome_exe()
+    if chrome is None:
+        log.warning("Chrome is not installed in the usual location, so its cookies could not be exported.")
+        return False
+    if not (EXTENSION_DIR / "manifest.json").is_file():
+        log.warning("Cookie extension is missing at %s", EXTENSION_DIR)
+        return False
+
+    token = secrets.token_urlsafe(24)
+    payload: dict = {}
+    done = threading.Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def _cors(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", f"chrome-extension://{EXTENSION_ID}")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Vary", "Origin")
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(204)
+            self._cors()
+            self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Streakbot-Token")
+            self.end_headers()
+
+        def do_POST(self) -> None:
+            if self.path.split("?", 1)[0] != "/cookies":
+                self.send_error(404)
+                return
+            if self.headers.get("X-Streakbot-Token") != token:
+                self.send_error(403)
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self.send_error(400)
+                return
+            if length <= 0 or length > 2_000_000:
+                self.send_error(400)
+                return
+            payload["body"] = self.rfile.read(length)
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+            done.set()
+
+        def log_message(self, fmt, *args) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"chrome-extension://{EXTENSION_ID}/export.html?port={port}&token={token}"
+    log.info("Asking the StreakBot Chrome extension to export Reddit cookies...")
+    try:
+        subprocess.Popen(
+            [str(chrome), "--profile-directory=Default", url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if not done.wait(45):
+            _log_extension_install_help()
+            return False
+        try:
+            data = json.loads(payload["body"].decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, KeyError):
+            log.warning("The cookie extension sent data that could not be read.")
+            return False
+        if not isinstance(data, list):
+            log.warning("The cookie extension sent an unexpected response.")
+            return False
+        written = write_extension_cookies_json(data, dest)
+        if not written:
+            log.warning("Chrome replied, but Reddit is not logged in there. Log in to Reddit in Chrome, then run again.")
+            return False
+        log.info("Exported %d Reddit cookies from Chrome to %s", written, dest)
+        return True
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def try_export_chrome_cookies(dest: Path) -> bool:
+    """Export Reddit cookies from the main Chrome profile via the local extension."""
+    return export_chrome_cookies_via_extension(dest)
+
+
+def prepare_cookie_source(config) -> Path | None:
+    """Export Reddit cookies from the main Chrome profile first. Fall back to the configured cookies file."""
+    dest = session_cookie_path(config)
+    if try_export_chrome_cookies(dest):
+        return dest
+    cookies_file = config.get("cookies_file")
+    if not cookies_file:
+        log.warning("Chrome export failed and no cookies_file is set.")
+        return None
+    cookies_path = Path(cookies_file)
+    if not cookies_path.is_absolute():
+        cookies_path = Path(__file__).resolve().parent / cookies_path
+    if not cookies_path.exists():
+        log.warning("Cookies file not found: %s", cookies_path)
+        return None
+    log.info("Using saved cookies file %s", cookies_path)
+    return cookies_path
 
 
 def load_cookies_from_json(file_path: Path, domain_filter: str = "reddit.com") -> list[dict]:
@@ -236,6 +385,196 @@ def load_cookies_from_netscape_file(file_path: Path, domain_filter: str = "reddi
     return cookies
 
 
+def session_cookie_path(config) -> Path:
+    """Where to write a fresh Cookie-Editor JSON export after login."""
+    cookies_file = config.get("cookies_file")
+    if cookies_file:
+        path = Path(cookies_file)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parent / path
+        if path.suffix.lower() == ".json":
+            return path
+    return Path(__file__).resolve().parent / "cookies.json"
+
+
+def save_reddit_cookies(context, dest: Path) -> int:
+    """Save current Reddit cookies in Cookie-Editor JSON format. Returns count written."""
+    raw = context.cookies()
+    same_site_out = {"None": "no_restriction", "Strict": "strict", "Lax": "lax"}
+    out = []
+    for c in raw:
+        domain = c.get("domain") or ""
+        if "reddit.com" not in domain:
+            continue
+        expires = c.get("expires")
+        session = expires is None or expires < 0
+        out.append({
+            "domain": domain,
+            "expirationDate": None if session else float(expires),
+            "hostOnly": not domain.startswith("."),
+            "httpOnly": bool(c.get("httpOnly", False)),
+            "name": c.get("name", ""),
+            "path": c.get("path", "/"),
+            "sameSite": same_site_out.get(c.get("sameSite") or "Lax", "lax"),
+            "secure": bool(c.get("secure", False)),
+            "session": session,
+            "storeId": None,
+            "value": c.get("value", ""),
+        })
+    if not out:
+        return 0
+    dest.write_text(json.dumps(out, indent=4), encoding="utf-8")
+    return len(out)
+
+
+def listing_upvote_buttons(page):
+    """Upvote buttons for real posts on a listing page."""
+    selectors = (
+        'shreddit-post button:has([icon-name="upvote"])',
+        'shreddit-post button[aria-label="upvote"]',
+        'shreddit-post [role="button"][aria-label="upvote"]',
+        'button:has([icon-name="upvote"])',
+        'button[aria-label="upvote"], [aria-label="upvote"]',
+    )
+    for sel in selectors:
+        found = page.locator(sel).all()
+        if found:
+            return found
+    return []
+
+
+def has_reddit_session(page) -> bool:
+    """True when the browser has Reddit's login cookie."""
+    try:
+        for c in page.context.cookies("https://www.reddit.com"):
+            if c.get("name") == "reddit_session" and c.get("value"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def cookie_file_candidates(config) -> list[Path]:
+    """The configured cookies file only. Backups such as cookies.json.old are ignored."""
+    base = Path(__file__).resolve().parent
+    cookies_file = config.get("cookies_file")
+    if not cookies_file:
+        return []
+    path = Path(cookies_file)
+    if not path.is_absolute():
+        path = base / path
+    return [path]
+
+
+def apply_saved_cookies(context, path: Path) -> int:
+    """Load a cookies file into the browser context. Returns how many cookies were added."""
+    if path.suffix.lower() == ".json":
+        cookies = load_cookies_from_json(path)
+    else:
+        cookies = load_cookies_from_netscape_file(path)
+    if cookies:
+        context.add_cookies(cookies)
+    return len(cookies)
+
+
+def recover_login_from_cookies(page, context, config) -> bool:
+    """When the browser has no login cookie, try Chrome and saved cookie files."""
+    log.warning("Not logged in. Exporting cookies from the main Chrome profile...")
+    dest = session_cookie_path(config)
+    if try_export_chrome_cookies(dest):
+        count = apply_saved_cookies(context, dest)
+        log.info("Loaded %d cookies exported from Chrome", count)
+        if has_reddit_session(page):
+            return True
+    found_any = False
+    for path in cookie_file_candidates(config):
+        if not path.exists():
+            log.info("Cookie file not found: %s", path)
+            continue
+        found_any = True
+        count = apply_saved_cookies(context, path)
+        log.info("Loaded %d cookies from %s", count, path)
+        if has_reddit_session(page):
+            log.info("Reddit session cookie found in %s", path)
+            return True
+    if not found_any:
+        log.warning("No cookie files found. Export cookies with Cookie-Editor or log in in the browser window.")
+    else:
+        log.warning("Saved cookies did not include a Reddit login session. Log in in the browser window.")
+    return False
+
+
+def page_has_captcha(page) -> bool:
+    """True when a captcha challenge is blocking the page.
+
+    Reddit embeds a reCAPTCHA anchor iframe on normal pages, including when you are logged in.
+    Only the challenge popup counts.
+    """
+    try:
+        frames = page.locator(
+            'iframe[src*="recaptcha"][src*="bframe"], '
+            'iframe[src*="hcaptcha.com"][src*="challenge"], '
+            'iframe[title*="recaptcha challenge" i]'
+        )
+        for i in range(frames.count()):
+            frame = frames.nth(i)
+            if not frame.is_visible():
+                continue
+            box = frame.bounding_box()
+            if box and box.get("width", 0) > 50 and box.get("height", 0) > 50:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def page_is_logged_in(page) -> bool:
+    """True only when Reddit's logged-in header is present. Upvote buttons also show while logged out."""
+    try:
+        if page.locator(
+            '#expand-user-drawer-button, shreddit-user-drawer, button[aria-label*="user menu" i], '
+            '[data-testid="user-drawer-button"]'
+        ).count() > 0:
+            return True
+        if page.locator('a[href*="/login"], a[href*="/register"]').count() > 0:
+            return False
+    except Exception:
+        return False
+    return False
+
+
+def wait_until_logged_in(page, listing_url: str | None = None, timeout_s: int = 600) -> bool:
+    """Wait until the logged-in header is visible and no captcha is up. Does not click vote buttons."""
+    log.warning("Not logged in. Upvote buttons are visible while logged out and do not count.")
+    log.info("Log in in the browser window (complete any captcha). Waiting up to %d minutes...", timeout_s // 60)
+    deadline = time.time() + timeout_s
+    captcha_logged = False
+    last_nav = 0.0
+    while time.time() < deadline:
+        if page_is_logged_in(page) and not page_has_captcha(page):
+            log.info("Logged-in header detected.")
+            return True
+        if page_has_captcha(page):
+            if not captcha_logged:
+                log.warning("Captcha is on the page. Complete it in the browser; the script will not click through it.")
+                captcha_logged = True
+            time.sleep(2)
+            continue
+        captcha_logged = False
+        url_now = (page.url or "").lower()
+        on_login = "login" in url_now or "register" in url_now or "captcha" in url_now
+        if listing_url and not on_login and "/r/" not in url_now and time.time() - last_nav > 15:
+            try:
+                page.goto(listing_url, wait_until="domcontentloaded")
+                page.wait_for_load_state("load", timeout=10_000)
+                time.sleep(2)
+                last_nav = time.time()
+            except Exception:
+                pass
+        time.sleep(2)
+    return False
+
+
 def run_upvote_flow(config):
     """Open Reddit, upvote one of top 3 posts, wait, then remove upvote."""
     subreddits = get_subreddits(config)
@@ -251,14 +590,7 @@ def run_upvote_flow(config):
     log.info("Starting upvote flow: r/%s (from %d subreddit(s)), will wait %.1f–%.1fs before removing (chose %.1fs)", subreddit, len(subreddits), wait_min, wait_max, wait_seconds)
 
     streak_check_url, upvoted_page_url = get_user_urls(config)
-    use_chrome_cookies = config.get("use_chrome_cookies", True)
-    cookies_file = config.get("cookies_file")
-    if cookies_file:
-        cookies_path = Path(cookies_file)
-        if not cookies_path.is_absolute():
-            cookies_path = Path(__file__).resolve().parent / cookies_path
-    else:
-        cookies_path = None
+    cookies_path = prepare_cookie_source(config)
 
     browser = None  # set when using our own window (cookies file or Chrome cookies)
     with sync_playwright() as p:
@@ -281,22 +613,10 @@ def run_upvote_flow(config):
             page = context.new_page()
             log.debug("Created new page (cookies context)")
             page.bring_to_front()
-        elif use_chrome_cookies:
-            log.info("Auth: grabbing cookies from Chrome profile, using our own window")
-            browser = p.chromium.launch(
-                headless=False,
-                args=["--disable-blink-features=AutomationControlled"],
-            )
-            context = browser.new_context()
-            cookies = load_cookies_from_chrome("reddit.com")
-            if not cookies:
-                log.error("No Reddit cookies from Chrome. Log in to Reddit in Chrome first, or use cookies_file.")
-                browser.close()
-                return False
-            context.add_cookies(cookies)
-            log.info("Loaded %d cookies from Chrome profile", len(cookies))
-            page = context.new_page()
-            page.bring_to_front()
+        elif config.get("use_chrome_cookies", True):
+            log.error("No Reddit cookies from Chrome. Load the StreakBot extension and log in to Reddit in Chrome.")
+            _log_extension_install_help()
+            return False
         else:
             log.info("Auth: using script browser profile at %s", USER_DATA_DIR)
             context = p.chromium.launch_persistent_context(
@@ -314,18 +634,20 @@ def run_upvote_flow(config):
         page.set_default_timeout(30_000)
 
         try:
-            if streak_check_url:
+            if not has_reddit_session(page):
+                recover_login_from_cookies(page, context, config)
+
+            if streak_check_url and not config.get("run_now") and not config.get("test_mode"):
                 log.info("Checking streak status before upvote...")
                 reached, days = check_streak_on_page(page, streak_check_url)
                 if days is not None:
                     log.info("Streak: %d day(s)", days)
-                if reached and not config.get("test_mode"):
+                if reached:
                     log.info("Streak already reached today, skipping upvote.")
                     return True
-                if reached and config.get("test_mode"):
-                    log.info("Streak already reached today; test_mode: doing upvote anyway.")
-                elif not reached:
-                    log.info("Streak not reached today — proceeding with upvote.")
+                log.info("Streak not reached today — proceeding with upvote.")
+            elif streak_check_url:
+                log.info("run_now/test_mode: skipping the streak-already-reached check.")
 
             log.info("Navigating to %s", url)
             page.bring_to_front()
@@ -335,22 +657,22 @@ def run_upvote_flow(config):
             log.info("Waiting 3s for vote buttons to render...")
             time.sleep(3)
 
-            # Reddit: only real posts (shreddit-post), not ads (shreddit-ad-post). Upvote button has [icon-name="upvote"].
-            upvotes = page.locator('shreddit-post button:has([icon-name="upvote"])').all()
-            if not upvotes:
-                upvotes = page.locator('shreddit-post button[aria-label="upvote"]').all()
-            if not upvotes:
-                upvotes = page.locator('shreddit-post [role="button"][aria-label="upvote"]').all()
-            if not upvotes:
-                log.debug("No upvote in shreddit-post, trying page-wide selectors")
-                upvotes = page.locator('button:has([icon-name="upvote"])').all()
-            if not upvotes:
-                upvotes = page.locator('button[aria-label="upvote"], [aria-label="upvote"]').all()
-
+            upvotes = listing_upvote_buttons(page)
+            if not page_is_logged_in(page) or page_has_captcha(page):
+                if not wait_until_logged_in(page, url):
+                    log.error("Stopped: still logged out or captcha was not cleared. No upvote was made.")
+                    context.close()
+                    return False
+                upvotes = listing_upvote_buttons(page)
             if len(upvotes) < 1:
-                log.error("No upvote buttons found. Are you logged in? Log in to Reddit in the browser.")
+                log.error("Logged in, but no upvote buttons found on the listing.")
                 context.close()
                 return False
+
+            if page_is_logged_in(page):
+                saved = save_reddit_cookies(context, session_cookie_path(config))
+                if saved:
+                    log.info("Saved %d Reddit cookies to %s", saved, session_cookie_path(config))
 
             # Pick one of the first 3 real posts; get its post URL only (do not click upvote on listing)
             n = min(3, len(upvotes))
@@ -394,21 +716,37 @@ def run_upvote_flow(config):
             page.wait_for_load_state("load", timeout=10_000)
             time.sleep(2)
 
-            # On the post page: click upvote (to upvote)
+            # On the post page: click upvote only after the logged-in header is visible.
+            if not page_is_logged_in(page) or page_has_captcha(page):
+                if not wait_until_logged_in(page):
+                    log.error("Stopped on the post page: not logged in, or a captcha is showing. No upvote was made.")
+                    context.close()
+                    return False
+
             upvote_btns = page.locator('[data-post-click-location="vote"] button[upvote]').all()
             if not upvote_btns:
                 upvote_btns = page.locator('shreddit-post button:has([icon-name="upvote"]), shreddit-post button[upvote]').all()
             if not upvote_btns:
-                upvote_btns = page.locator('button:has([icon-name="upvote"]), button[upvote], button[aria-label="upvote"]').all()
-            if upvote_btns:
-                upvote_btns[0].scroll_into_view_if_needed()
-                time.sleep(0.3)
-                upvote_btns[0].click()
-                log.info("Upvoted on post page.")
-            else:
+                upvote_btns = page.locator('button:has([icon-name="upvote"]), button[upvote]').all()
+            if not upvote_btns:
                 log.warning("No upvote button found on post page.")
                 context.close()
                 return False
+
+            upvote_btns[0].scroll_into_view_if_needed()
+            time.sleep(0.3)
+            upvote_btns[0].click()
+            time.sleep(1.5)
+            if page_has_captcha(page) or not page_is_logged_in(page):
+                log.error("Upvote did not register: captcha or login wall appeared. You were not upvoted.")
+                context.close()
+                return False
+            pressed = page.locator('button[upvote][aria-pressed="true"], button[aria-pressed="true"][upvote]').count()
+            if pressed < 1:
+                log.error("Clicked upvote, but the button is not pressed. The vote was not applied.")
+                context.close()
+                return False
+            log.info("Upvoted on post page (button is pressed).")
 
             log.info("Waiting %.1fs before removing upvote...", wait_seconds)
             time.sleep(wait_seconds)
@@ -436,6 +774,14 @@ def run_upvote_flow(config):
                 log.info("Removed upvote on post page.")
             else:
                 log.warning("No vote button found on post page to remove upvote; upvote may still be active.")
+
+            saved = 0
+            if page_is_logged_in(page):
+                saved = save_reddit_cookies(context, session_cookie_path(config))
+            if saved:
+                log.info("Updated %d Reddit cookies in %s", saved, session_cookie_path(config))
+            else:
+                log.info("Did not overwrite the cookies file; the browser is not logged in.")
 
             if streak_check_url:
                 log.info("Rechecking streak status after upvote...")
@@ -491,14 +837,7 @@ def run_streak_check(config):
         log.error("test_mode is true but reddit_username (or streak_check_url) is not set in config.")
         return False
 
-    use_chrome_cookies = config.get("use_chrome_cookies", True)
-    cookies_file = config.get("cookies_file")
-    if cookies_file:
-        cookies_path = Path(cookies_file)
-        if not cookies_path.is_absolute():
-            cookies_path = Path(__file__).resolve().parent / cookies_path
-    else:
-        cookies_path = None
+    cookies_path = prepare_cookie_source(config)
 
     browser = None
     with sync_playwright() as p:
@@ -513,17 +852,10 @@ def run_streak_check(config):
             if cookies:
                 context.add_cookies(cookies)
             page = context.new_page()
-        elif use_chrome_cookies:
-            log.info("Auth: grabbing cookies from Chrome profile (test mode)")
-            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
-            context = browser.new_context()
-            cookies = load_cookies_from_chrome("reddit.com")
-            if not cookies:
-                log.error("No Reddit cookies from Chrome. Log in to Reddit in Chrome first, or use cookies_file.")
-                browser.close()
-                return False
-            context.add_cookies(cookies)
-            page = context.new_page()
+        elif config.get("use_chrome_cookies", True):
+            log.error("No Reddit cookies from Chrome. Load the StreakBot extension and log in to Reddit in Chrome.")
+            _log_extension_install_help()
+            return False
         else:
             log.info("Auth: using script browser profile (test mode)")
             context = p.chromium.launch_persistent_context(
@@ -602,20 +934,52 @@ def main():
         run_upvote_flow(config)
         return
 
-    run_time = config["run_time"]  # e.g. "09:00"
-    hour, minute = map(int, run_time.split(":"))
     subreddits = get_subreddits(config)
-    log.info("Scheduler started: run daily at %s, subreddits r/%s", run_time, ", r/".join(subreddits) if subreddits else "?")
+    run_time_min = config.get("run_time_min")
+    run_time_max = config.get("run_time_max")
+    use_random_time = run_time_min and run_time_max
+
+    if use_random_time:
+        min_minutes = _time_to_minutes(run_time_min)
+        max_minutes = _time_to_minutes(run_time_max)
+        if min_minutes > max_minutes:
+            min_minutes, max_minutes = max_minutes, min_minutes
+        log.info(
+            "Scheduler started: run daily at a random time between %s and %s, subreddits r/%s",
+            run_time_min, run_time_max, ", r/".join(subreddits) if subreddits else "?",
+        )
+        scheduled_day = None
+        target_minutes = None
+        last_run_day = None
+    else:
+        run_time = config["run_time"]  # e.g. "09:00"
+        hour, minute = map(int, str(run_time).strip().split(":", 1))
+        log.info("Scheduler started: run daily at %s, subreddits r/%s", run_time, ", r/".join(subreddits) if subreddits else "?")
     log.info("Minimize this window; browser will open at the scheduled time")
     log.info("First run: log in to Reddit in the browser window when it opens")
 
     while True:
         now = time.localtime()
-        if now.tm_hour == hour and now.tm_min == minute:
-            log.info("Scheduled time reached — starting upvote flow")
-            run_upvote_flow(config)
-            log.debug("Sleeping 65s to avoid re-running in same minute")
-            time.sleep(65)
+        today = (now.tm_year, now.tm_yday)
+        now_minutes = now.tm_hour * 60 + now.tm_min
+
+        if use_random_time:
+            if target_minutes is None or scheduled_day != today:
+                target_minutes = random.randint(min_minutes, max_minutes)
+                scheduled_day = today
+                log.info("Today's run scheduled at %s", _minutes_to_time(target_minutes))
+            if now_minutes >= target_minutes and last_run_day != today:
+                log.info("Scheduled time reached — starting upvote flow")
+                run_upvote_flow(config)
+                last_run_day = today
+                log.debug("Sleeping 65s to avoid re-running")
+                time.sleep(65)
+        else:
+            if now.tm_hour == hour and now.tm_min == minute:
+                log.info("Scheduled time reached — starting upvote flow")
+                run_upvote_flow(config)
+                log.debug("Sleeping 65s to avoid re-running in same minute")
+                time.sleep(65)
         time.sleep(30)
 
 

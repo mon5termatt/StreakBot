@@ -5,8 +5,10 @@
 subreddits: ["python", "askreddit"]
 # subreddit: "python"   # alternative: single subreddit
 
-# Time to run (24-hour format)
+# Time to run (24-hour format). Use either a fixed time or a random window:
 run_time: "09:00"
+# run_time_min: "08:30"   # optional: random run between min and max
+# run_time_max: "09:30"
 
 # Random wait (seconds) before removing the upvote
 wait_seconds_min: 30
@@ -14,7 +16,7 @@ wait_seconds_max: 90
 
 # Auth: Chrome cookies or cookies file
 use_chrome_cookies: true
-# cookies_file: "cookies.json"   # optional; export with Cookie-Editor
+# cookies_file: "cookies.json"   # optional; filled by the Chrome extension, or export with Cookie-Editor
 
 # Run once immediately (for testing)
 run_now: false
